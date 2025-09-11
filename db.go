@@ -6,9 +6,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ensureSchema cria/ajusta as tabelas necessárias (idempotente).
+// ensureSchema cria/ajusta o schema necessário.
+// É idempotente e combina CREATE IF NOT EXISTS com pequenos ajustes.
 func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
-	// Garantia extra (o AfterConnect já faz isso)
+	// Força search_path public (também feito no AfterConnect)
 	_, _ = db.Exec(ctx, `SET search_path TO public`)
 
 	stmts := []string{
@@ -28,21 +29,28 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
 
-		// USERS
+		// USERS (compatível com handlers.go)
 		`CREATE TABLE IF NOT EXISTS public.users (
 			id            BIGSERIAL PRIMARY KEY,
 			org_id        BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
 			flow_id       BIGINT NOT NULL REFERENCES public.flows(id) ON DELETE CASCADE,
 			name          TEXT NOT NULL,
 			email         TEXT NOT NULL UNIQUE,
-			password_hash TEXT NOT NULL,
+			password      TEXT NOT NULL,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
-		`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS org_id BIGINT;`,
-		`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS flow_id BIGINT;`,
-		`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS password_hash TEXT;`,
-		`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
-		`CREATE INDEX IF NOT EXISTS idx_users_email_lower ON public.users (LOWER(email));`,
+		-- Ajustes defensivos p/ quem tinha schema antigo
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='org_id')
+			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN org_id BIGINT'; END IF;
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='flow_id')
+			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN flow_id BIGINT'; END IF;
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='password')
+			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN password TEXT NOT NULL DEFAULT ''''''; END IF;
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='created_at')
+			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'; END IF;
+		END $$;`,
+		`CREATE INDEX IF NOT EXISTS idx_users_email_lower ON public.users ((LOWER(email)));`,
 
 		// COMPANY
 		`CREATE TABLE IF NOT EXISTS public.company (
@@ -105,7 +113,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
 
-		// ANALYTICS (vendas por hora)
+		// ANALYTICS
 		`CREATE TABLE IF NOT EXISTS public.analytics_sales_by_hour (
 			id      BIGSERIAL PRIMARY KEY,
 			org_id  BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
@@ -113,8 +121,9 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			t       TIMESTAMPTZ NOT NULL,
 			c       INTEGER NOT NULL DEFAULT 0
 		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sales_hour_org_flow_t ON public.analytics_sales_by_hour (org_id, flow_id, t);`,
 
-		// WA: instâncias e mensagens
+		// WHATSAPP: INSTÂNCIAS
 		`CREATE TABLE IF NOT EXISTS public.wa_instances (
 			id          BIGSERIAL PRIMARY KEY,
 			org_id      BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
@@ -126,18 +135,22 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			logged_in   BOOLEAN,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_wa_instances_instance_id ON public.wa_instances(instance_id);`,
+
+		// WHATSAPP: MENSAGENS
 		`CREATE TABLE IF NOT EXISTS public.wa_messages (
 			id           BIGSERIAL PRIMARY KEY,
 			org_id       BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
 			flow_id      BIGINT NOT NULL REFERENCES public.flows(id) ON DELETE CASCADE,
 			instance_id  TEXT,
-			direction    TEXT, -- in/out
+			direction    TEXT,
 			to_number    TEXT,
 			from_number  TEXT,
 			payload      JSONB,
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wa_messages_created ON public.wa_messages (created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_wa_messages_org_flow ON public.wa_messages (org_id, flow_id);`,
 
 		// WEBHOOKS LOG
 		`CREATE TABLE IF NOT EXISTS public.webhooks_log (
