@@ -38,6 +38,7 @@ type uazapiClient struct {
 	base string
 	http *http.Client
 }
+
 func newUazapiClient() *uazapiClient {
 	base := os.Getenv("UAZAPI_BASE")
 	if base == "" {
