@@ -39,20 +39,41 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			password      TEXT NOT NULL,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
-		-- Ajustes defensivos p/ quem tinha schema antigo
+
+		// Ajustes defensivos em bases antigas
 		`DO $$ BEGIN
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='org_id')
-			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN org_id BIGINT'; END IF;
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='flow_id')
-			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN flow_id BIGINT'; END IF;
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='password')
-			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN password TEXT NOT NULL DEFAULT ''''''; END IF;
-			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='created_at')
-			THEN EXECUTE 'ALTER TABLE public.users ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'; END IF;
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema='public' AND table_name='users' AND column_name='org_id'
+			) THEN
+				EXECUTE 'ALTER TABLE public.users ADD COLUMN org_id BIGINT';
+			END IF;
+
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema='public' AND table_name='users' AND column_name='flow_id'
+			) THEN
+				EXECUTE 'ALTER TABLE public.users ADD COLUMN flow_id BIGINT';
+			END IF;
+
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema='public' AND table_name='users' AND column_name='password'
+			) THEN
+				EXECUTE 'ALTER TABLE public.users ADD COLUMN password TEXT NOT NULL DEFAULT '''''';
+			END IF;
+
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema='public' AND table_name='users' AND column_name='created_at'
+			) THEN
+				EXECUTE 'ALTER TABLE public.users ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()';
+			END IF;
 		END $$;`,
+
 		`CREATE INDEX IF NOT EXISTS idx_users_email_lower ON public.users ((LOWER(email)));`,
 
-		// COMPANY
+		// COMPANY (um registro por org)
 		`CREATE TABLE IF NOT EXISTS public.company (
 			org_id              BIGINT PRIMARY KEY REFERENCES public.orgs(id) ON DELETE CASCADE,
 			razao_social        TEXT,
@@ -143,7 +164,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			org_id       BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
 			flow_id      BIGINT NOT NULL REFERENCES public.flows(id) ON DELETE CASCADE,
 			instance_id  TEXT,
-			direction    TEXT,
+			direction    TEXT, -- in/out
 			to_number    TEXT,
 			from_number  TEXT,
 			payload      JSONB,
@@ -172,6 +193,12 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			profile    JSONB,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
+
+		// SEEDS (org=1 e flow=1)
+		`INSERT INTO public.orgs (id, name) VALUES (1, 'Default Org')
+		 ON CONFLICT (id) DO NOTHING;`,
+		`INSERT INTO public.flows (id, org_id, name) VALUES (1, 1, 'Default Flow')
+		 ON CONFLICT (id) DO NOTHING;`,
 	}
 
 	for _, q := range stmts {
