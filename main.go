@@ -1,127 +1,118 @@
 package main
 
 import (
-	"context"
-	"log"
-	"net/http"
-	"os"
-	"strings"
-	"time"
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "strings"
+    "time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+    "github.com/go-chi/cors"
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/joho/godotenv"
 )
 
 type App struct{ DB *pgxpool.Pool }
 
 func main() {
-	_ = godotenv.Load()
-	addr := getenv("APP_ADDR", ":8080")
-	dsn := getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/app?sslmode=disable")
+    _ = godotenv.Load()
+    addr := getenv("APP_ADDR", ":8080")
+    dsn := getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/app?sslmode=disable")
 
-	ctx := context.Background()
+    ctx := context.Background()
+    pool, err := pgxpool.New(ctx, dsn)
+    if err != nil {
+        log.Fatalf("db: %v", err)
+    }
+    defer pool.Close()
 
-	// --------- Pool com AfterConnect para garantir search_path=public ----------
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		log.Fatalf("db parse config: %v", err)
-	}
-	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, `SET search_path TO public`)
-		return err
-	}
+    app := &App{DB: pool}
 
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		log.Fatalf("db: %v", err)
-	}
-	defer pool.Close()
+    r := chi.NewRouter()
+    r.Use(middleware.RequestID)
+    r.Use(middleware.RealIP)
+    r.Use(middleware.Logger)
+    r.Use(middleware.Recoverer)
+    r.Use(middleware.Timeout(60 * time.Second))
 
-	// Cria/ajusta o schema ao subir (idempotente)
-	if err := ensureSchema(ctx, pool); err != nil {
-		log.Fatalf("schema: %v", err)
-	}
+    // CORS via github.com/go-chi/cors
+    r.Use(cors.Handler(cors.Options{
+        // ALLOWED_ORIGINS="https://a.com,https://b.com" ou "*" (padrão)
+        AllowedOrigins:   allowedOrigins(),
+        AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+        AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Org-ID", "X-Flow-ID"},
+        ExposedHeaders:   []string{"Link"},
+        AllowCredentials: false,
+        MaxAge:           300,
+    }))
+    // Preflight catch-all (o middleware já cobre, mas deixamos por segurança)
+    r.Options("/*", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
-	app := &App{DB: pool}
+    // Healthcheck
+    r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        _, _ = w.Write([]byte("ok"))
+    })
 
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+    // API
+    r.Route("/api", func(r chi.Router) {
+        app.mountAuth(r)
+        app.mountCatalog(r)
+        app.mountLeads(r)
+        app.mountOrders(r)
+        app.mountAnalytics(r)
+        app.mountChat(r)    // /api/chat, /api/vision/upload
+        app.mountCompany(r) // /api/company
+        app.mountUpload(r)  // /api/upload
+        app.mountResolve(r) // /api/orgs/resolve/{tax_id}
 
-	// CORS via github.com/go-chi/cors
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   allowedOrigins(),
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Org-ID", "X-Flow-ID"},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: false,
-		MaxAge:           300,
-	}))
-	r.Options("/*", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
+        r.Post("/webhooks/n8n", app.webhookN8N)
+        // Webhook para eventos da uazapi (multi-instância). Os eventos
+        // chegarão em /webhooks/wa/{instance} e serão reconhecidos com status 202.
+        // A lógica de encaminhamento para o agente IA deve ser implementada em webhook_wa.go.
+        r.Post("/webhooks/wa/{instance}", app.webhookWa)
 
-	// Healthcheck
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+        // Rotas de integração com WhatsApp (uazapi).
+        // As rotas abaixo permitem criar instâncias de WhatsApp,
+        // acompanhar o status/QR Code, definir o webhook de entrada
+        // e enviar mensagens de texto via cada instância.
+        app.mountWhatsApp(r)
+    })
 
-	// API
-	r.Route("/api", func(r chi.Router) {
-		app.mountAuth(r)
-		app.mountCatalog(r)
-		app.mountLeads(r)
-		app.mountOrders(r)
-		app.mountAnalytics(r)
-		app.mountChat(r)    // /api/chat, /api/vision/upload
-		app.mountCompany(r) // /api/company
-		app.mountUpload(r)  // /api/upload
-		app.mountResolve(r) // /api/orgs/resolve/{tax_id}
+    // Servir uploads estáticos (sem /api)
+    uploadDir := getenv("UPLOAD_DIR", "uploads")
+    r.Mount("/uploads", http.StripPrefix("/uploads", http.FileServer(http.Dir(uploadDir))))
 
-		r.Post("/webhooks/n8n", app.webhookN8N)
-		r.Post("/webhooks/wa/{instance}", app.webhookWa)
-
-		// Integração WhatsApp (uazapi)
-		app.mountWhatsApp(r)
-	})
-
-	// Servir uploads estáticos (sem /api)
-	uploadDir := getenv("UPLOAD_DIR", "uploads")
-	r.Mount("/uploads", http.StripPrefix("/uploads", http.FileServer(http.Dir(uploadDir))))
-
-	log.Printf("listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, r))
+    log.Printf("listening on %s", addr)
+    // IMPORTANTE: usar o router diretamente (sem corsMiddleware aqui).
+    log.Fatal(http.ListenAndServe(addr, r))
 }
 
 func getenv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
+    if v := os.Getenv(k); v != "" {
+        return v
+    }
+    return def
 }
 
 func allowedOrigins() []string {
-	v := strings.TrimSpace(os.Getenv("ALLOWED_ORIGINS"))
-	if v == "" || v == "*" {
-		return []string{"*"}
-	}
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		s := strings.TrimSpace(p)
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	if len(out) == 0 {
-		return []string{"*"}
-	}
-	return out
+    v := strings.TrimSpace(os.Getenv("ALLOWED_ORIGINS"))
+    if v == "" || v == "*" {
+        return []string{"*"}
+    }
+    parts := strings.Split(v, ",")
+    out := make([]string, 0, len(parts))
+    for _, p := range parts {
+        s := strings.TrimSpace(p)
+        if s != "" {
+            out = append(out, s)
+        }
+    }
+    if len(out) == 0 {
+        return []string{"*"}
+    }
+    return out
 }
