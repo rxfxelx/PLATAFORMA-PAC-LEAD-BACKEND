@@ -6,8 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ensureSchema cria/ajusta o schema necessário.
-// É idempotente e combina CREATE IF NOT EXISTS com pequenos ajustes.
+// ensureSchema cria/ajusta o schema necessário de forma idempotente.
 func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 	// Força search_path public (também feito no AfterConnect)
 	_, _ = db.Exec(ctx, `SET search_path TO public`)
@@ -29,7 +28,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
 
-		// USERS (compatível com handlers.go)
+		// USERS (compatível com seu handlers.go -> coluna "password")
 		`CREATE TABLE IF NOT EXISTS public.users (
 			id            BIGSERIAL PRIMARY KEY,
 			org_id        BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
@@ -40,7 +39,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
 
-		// Ajustes defensivos em bases antigas
+		// Ajustes defensivos para bases antigas (adiciona colunas que faltarem)
 		`DO $$ BEGIN
 			IF NOT EXISTS (
 				SELECT 1 FROM information_schema.columns
@@ -73,7 +72,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 
 		`CREATE INDEX IF NOT EXISTS idx_users_email_lower ON public.users ((LOWER(email)));`,
 
-		// COMPANY (um registro por org)
+		// COMPANY (1 registro por org)
 		`CREATE TABLE IF NOT EXISTS public.company (
 			org_id              BIGINT PRIMARY KEY REFERENCES public.orgs(id) ON DELETE CASCADE,
 			razao_social        TEXT,
@@ -134,7 +133,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);`,
 
-		// ANALYTICS
+		// ANALYTICS (vendas por hora)
 		`CREATE TABLE IF NOT EXISTS public.analytics_sales_by_hour (
 			id      BIGSERIAL PRIMARY KEY,
 			org_id  BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
@@ -164,7 +163,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			org_id       BIGINT NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
 			flow_id      BIGINT NOT NULL REFERENCES public.flows(id) ON DELETE CASCADE,
 			instance_id  TEXT,
-			direction    TEXT, -- in/out
+			direction    TEXT,
 			to_number    TEXT,
 			from_number  TEXT,
 			payload      JSONB,
