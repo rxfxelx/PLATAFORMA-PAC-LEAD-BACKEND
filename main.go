@@ -26,7 +26,7 @@ func main() {
 
 	ctx := context.Background()
 
-	// Pool com AfterConnect para garantir search_path=public
+	// --------- Pool com AfterConnect para garantir search_path=public ----------
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		log.Fatalf("db parse config: %v", err)
@@ -56,7 +56,7 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
-	// CORS
+	// CORS via github.com/go-chi/cors
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   allowedOrigins(),
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -86,11 +86,13 @@ func main() {
 		app.mountResolve(r) // /api/orgs/resolve/{tax_id}
 
 		r.Post("/webhooks/n8n", app.webhookN8N)
-		r.Post("/webhooks/wa/{instance}", app.webhookWa) // webhook Uazapi -> plataforma -> agente
-		app.mountWhatsApp(r)                              // rotas de integração com uazapi
+		r.Post("/webhooks/wa/{instance}", app.webhookWa)
+
+		// Integração WhatsApp (uazapi)
+		app.mountWhatsApp(r)
 	})
 
-	// uploads estáticos
+	// Servir uploads estáticos (sem /api)
 	uploadDir := getenv("UPLOAD_DIR", "uploads")
 	r.Mount("/uploads", http.StripPrefix("/uploads", http.FileServer(http.Dir(uploadDir))))
 
