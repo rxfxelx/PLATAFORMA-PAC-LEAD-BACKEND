@@ -39,11 +39,6 @@ func (a *App) mountAuth(r chi.Router) {
 
 // POST /auth/register
 func (a *App) register(w http.ResponseWriter, r *http.Request) {
-	// The registration endpoint now expects an additional tax identifier (CPF or
-	// CNPJ). This identifier will be stored alongside the organisation so
-	// individual flows and products can be associated with a specific legal
-	// entity. We trim spaces and lower‑case the email for consistency. If any
-	// required field is missing the request is rejected.
 	var in struct {
 		Name     string `json:"name"`
 		Email    string `json:"email"`
@@ -61,7 +56,7 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name, email, password and tax_id are required", http.StatusBadRequest)
 		return
 	}
-	// validate TaxID: remove non‑digits and ensure it has either 11 (CPF) or 14 (CNPJ) digits
+	// normaliza tax_id (só dígitos) e valida 11/14
 	digits := strings.Map(func(r rune) rune {
 		if r >= '0' && r <= '9' {
 			return r
@@ -69,10 +64,9 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		return -1
 	}, in.TaxID)
 	if len(digits) != 11 && len(digits) != 14 {
-		http.Error(w, "tax_id must be a valid CPF (11 digits) or CNPJ (14 digits)", http.StatusBadRequest)
+		http.Error(w, "tax_id must be a valid CPF (11) or CNPJ (14)", http.StatusBadRequest)
 		return
 	}
-	// normalise: store only digits
 	in.TaxID = digits
 
 	// já existe?
@@ -96,14 +90,14 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.WithValue(r.Context(), "op", "register")
 
-	// org
+	// org (com tax_id)
 	var orgID int64
-	// insert organisation with tax_id; assumes the orgs table has a tax_id column.
 	if err := a.DB.QueryRow(ctx,
 		`INSERT INTO public.orgs(name, tax_id) VALUES($1, $2) RETURNING id`, in.Name, in.TaxID).Scan(&orgID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	// flow
 	var flowID int64
 	if err := a.DB.QueryRow(ctx,
@@ -111,10 +105,11 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// user
+
+	// user (usa 'password' como no seu código original)
 	var userID int64
 	if err := a.DB.QueryRow(ctx,
-		`INSERT INTO public.users(org_id, flow_id, name, email, password_hash)
+		`INSERT INTO public.users(org_id, flow_id, name, email, password)
 		 VALUES($1,$2,$3,$4,$5) RETURNING id`,
 		orgID, flowID, in.Name, in.Email, string(hashed)).Scan(&userID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -131,7 +126,6 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"access_token": token, "token_type": "bearer", "expires_in": 24 * 3600,
 		"id": userID, "email": in.Email, "name": in.Name, "org_id": orgID, "flow_id": flowID,
-		// include tax_id in the response so clients can persist it if needed
 		"tax_id": in.TaxID,
 	})
 }
@@ -154,9 +148,8 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 
 	var userID, orgID, flowID int64
 	var hashed, name, taxID string
-	// join users with orgs to fetch the tax identifier
 	if err := a.DB.QueryRow(r.Context(),
-		`SELECT u.id, u.org_id, u.flow_id, u.name, u.password_hash, o.tax_id
+		`SELECT u.id, u.org_id, u.flow_id, u.name, u.password, o.tax_id
          FROM public.users u
          JOIN public.orgs o ON u.org_id=o.id
          WHERE LOWER(u.email)=LOWER($1)`,
@@ -244,12 +237,10 @@ func extractUserFromToken(r *http.Request) (int64, int64, int64, error) {
 	}
 	raw := parts[1]
 
-	// jwtauth v5 com jwx/v2: Decode -> (jwt.Token, error)
 	tok, err := tokenAuth.Decode(raw)
 	if err != nil || tok == nil {
 		return 0, 0, 0, errors.New("invalid token")
 	}
-	// valida exp/iat
 	if err := jwxjwt.Validate(tok); err != nil {
 		return 0, 0, 0, errors.New("expired or invalid token")
 	}
