@@ -70,6 +70,9 @@ func main() {
         app.mountUpload(r)  // /api/upload
         app.mountResolve(r) // /api/orgs/resolve/{tax_id}
 
+        // >>> ADICIONADO: configurações do agente (multi-tenant)
+        app.mountAgentConfig(r)
+
         r.Post("/webhooks/n8n", app.webhookN8N)
         // Webhook para eventos da uazapi (multi-instância).
         // Chegam em /webhooks/wa/{instance} e são respondidos com 202.
