@@ -33,8 +33,8 @@ func (app *App) mountWhatsApp(r chi.Router) {
 		r.Post("/instances", app.waCreateInstance)
 
 		r.Get("/instances/{instance}/status", app.waInstanceStatus)
-		r.Get("/instances/{instance}/qr", app.waInstanceQR)      // fallback
-		r.Get("/instances/{instance}/qrcode", app.waInstanceQR)  // fallback (alias)
+		r.Get("/instances/{instance}/qr", app.waInstanceQR)     // fallback
+		r.Get("/instances/{instance}/qrcode", app.waInstanceQR) // fallback (alias)
 
 		r.Post("/instances/{instance}/webhook", app.waSetWebhook)
 		r.Post("/instances/{instance}/send/text", app.waSendText)
@@ -163,6 +163,41 @@ func randToken(n int) string {
 }
 
 // ================================
+// Modelo/DAO
+// ================================
+type waInstanceRow struct {
+	InstanceID string
+	Token      string
+	OrgID      int64
+	FlowID     int64
+	WebhookURL string
+}
+
+func (app *App) fetchWAInstance(ctx context.Context, instanceID string) (waInstanceRow, error) {
+	var row waInstanceRow
+	err := app.DB.QueryRow(ctx, `
+		SELECT instance_id, token, org_id, flow_id, COALESCE(webhook_url,'')
+		FROM public.wa_instances
+		WHERE instance_id = $1
+		LIMIT 1
+	`, instanceID).Scan(&row.InstanceID, &row.Token, &row.OrgID, &row.FlowID, &row.WebhookURL)
+	return row, err
+}
+
+func (app *App) authorizeInstanceAccess(r *http.Request, row waInstanceRow, suppliedToken string) bool {
+	reqOrg := parseIntHeader(r, "X-Org-ID", -1)
+	reqFlow := parseIntHeader(r, "X-Flow-ID", -1)
+	// Regra: ou é o mesmo tenant, ou possui o token da instância
+	if reqOrg > 0 && reqFlow > 0 && row.OrgID == reqOrg && row.FlowID == reqFlow {
+		return true
+	}
+	if strings.TrimSpace(suppliedToken) != "" && strings.TrimSpace(suppliedToken) == strings.TrimSpace(row.Token) {
+		return true
+	}
+	return false
+}
+
+// ================================
 // Tabelas necessárias
 // ================================
 func (app *App) ensureWhatsAppTables(ctx context.Context) error {
@@ -180,6 +215,9 @@ CREATE TABLE IF NOT EXISTS public.wa_instances (
 	if err != nil {
 		return err
 	}
+	// Índice auxiliar por tenant (para auditoria/listagens futuras)
+	_, _ = app.DB.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_wa_instances_org_flow ON public.wa_instances(org_id, flow_id);`)
+
 	// webhooks_log (usada pelo webhook_wa.go)
 	_, err = app.DB.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS public.webhooks_log (
@@ -295,7 +333,17 @@ func (app *App) waInstanceStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing instance", http.StatusBadRequest)
 		return
 	}
-	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	suppliedToken := strings.TrimSpace(r.URL.Query().Get("token"))
+
+	row, err := app.fetchWAInstance(ctx, instance)
+	if err != nil {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	if !app.authorizeInstanceAccess(r, row, suppliedToken) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 
 	uaz := newUAZClient()
 	// Sem provedor: modo mock
@@ -313,8 +361,11 @@ func (app *App) waInstanceStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := url.Values{}
-	if token != "" {
-		q.Set("token", token)
+	if suppliedToken != "" {
+		q.Set("token", suppliedToken)
+	} else if row.Token != "" {
+		// fallback: usa o token persistido caso o front não tenha enviado
+		q.Set("token", row.Token)
 	}
 	resp, err := uaz.doJSON(ctx, http.MethodGet, "/instances/"+url.PathEscape(instance)+"/status", q, nil)
 	if err != nil {
@@ -352,7 +403,17 @@ func (app *App) waInstanceQR(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing instance", http.StatusBadRequest)
 		return
 	}
-	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	suppliedToken := strings.TrimSpace(r.URL.Query().Get("token"))
+
+	row, err := app.fetchWAInstance(ctx, instance)
+	if err != nil {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	if !app.authorizeInstanceAccess(r, row, suppliedToken) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 
 	uaz := newUAZClient()
 	if !uaz.configured() {
@@ -366,9 +427,12 @@ func (app *App) waInstanceQR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := url.Values{}
-	if token != "" {
-		q.Set("token", token)
+	if suppliedToken != "" {
+		q.Set("token", suppliedToken)
+	} else if row.Token != "" {
+		q.Set("token", row.Token)
 	}
+
 	// Tentamos endpoint /qr e /qrcode
 	paths := []string{
 		"/instances/" + url.PathEscape(instance) + "/qr",
@@ -416,8 +480,19 @@ func (app *App) waSetWebhook(w http.ResponseWriter, r *http.Request) {
 	webhookURL := strings.TrimSpace(fmt.Sprint(body["url"]))
 	token := strings.TrimSpace(fmt.Sprint(body["token"]))
 
+	row, err := app.fetchWAInstance(ctx, instance)
+	if err != nil {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	// Acesso autorizado?
+	if !app.authorizeInstanceAccess(r, row, token) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	// Atualiza DB (salva URL do webhook)
-	_ = app.upsertWAInstance(ctx, instance, token, parseIntHeader(r, "X-Org-ID", 1), parseIntHeader(r, "X-Flow-ID", 1), webhookURL)
+	_ = app.upsertWAInstance(ctx, instance, chooseFirstNonEmpty(token, row.Token), parseIntHeader(r, "X-Org-ID", row.OrgID), parseIntHeader(r, "X-Flow-ID", row.FlowID), webhookURL)
 
 	uaz := newUAZClient()
 	if !uaz.configured() {
@@ -458,6 +533,16 @@ func (app *App) waSendText(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	row, err := app.fetchWAInstance(ctx, instance)
+	if err != nil {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	if !app.authorizeInstanceAccess(r, row, in.Token) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	uaz := newUAZClient()
 	if !uaz.configured() {
 		// Modo demo: tudo certo
@@ -471,7 +556,7 @@ func (app *App) waSendText(w http.ResponseWriter, r *http.Request) {
 
 	// Proxy p/ provedor
 	reqBody := map[string]any{
-		"token": in.Token,
+		"token": chooseFirstNonEmpty(in.Token, row.Token),
 		"to":    in.To,
 		"text":  in.Text,
 	}
@@ -501,10 +586,17 @@ func (app *App) waSendText(w http.ResponseWriter, r *http.Request) {
 }
 
 // ================================
-// Util de resposta JSON
+// Utils
 // ================================
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func chooseFirstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
