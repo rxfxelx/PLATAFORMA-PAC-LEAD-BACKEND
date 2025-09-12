@@ -43,7 +43,8 @@ func main() {
         // ALLOWED_ORIGINS="https://a.com,https://b.com" ou "*" (padrão)
         AllowedOrigins:   allowedOrigins(),
         AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-        AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Org-ID", "X-Flow-ID"},
+        // (ATUALIZADO) Inclui headers usados para escopo multi-tenant/instância
+        AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Org-ID", "X-Flow-ID", "X-Instance-ID", "X-Instance-Token"},
         ExposedHeaders:   []string{"Link"},
         AllowCredentials: false,
         MaxAge:           300,
@@ -70,15 +71,12 @@ func main() {
         app.mountResolve(r) // /api/orgs/resolve/{tax_id}
 
         r.Post("/webhooks/n8n", app.webhookN8N)
-        // Webhook para eventos da uazapi (multi-instância). Os eventos
-        // chegarão em /webhooks/wa/{instance} e serão reconhecidos com status 202.
-        // A lógica de encaminhamento para o agente IA deve ser implementada em webhook_wa.go.
+        // Webhook para eventos da uazapi (multi-instância).
+        // Chegam em /webhooks/wa/{instance} e são respondidos com 202.
         r.Post("/webhooks/wa/{instance}", app.webhookWa)
 
         // Rotas de integração com WhatsApp (uazapi).
-        // As rotas abaixo permitem criar instâncias de WhatsApp,
-        // acompanhar o status/QR Code, definir o webhook de entrada
-        // e enviar mensagens de texto via cada instância.
+        // Para criar instância, ver status/QR, definir webhook e enviar mensagens.
         app.mountWhatsApp(r)
     })
 
