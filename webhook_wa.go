@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -34,20 +36,29 @@ func (app *App) webhookWa(w http.ResponseWriter, r *http.Request) {
 		`INSERT INTO public.webhooks_log(source, payload) VALUES($1, $2)`,
 		"uazapi", json.RawMessage(body))
 
-	// recupera token da instância
-	token, _ := app.lookupInstanceToken(r.Context(), instance)
-
-	// encaminha para o backend do Agente IA
-	agentURL := strings.TrimRight(os.Getenv("AGENT_BACKEND_URL"), "/")
-	if agentURL == "" {
-		agentURL = "https://paclead-agente-backend-production.up.railway.app/webhook/uazapi"
-	}
-	// se vier sem caminho, garante o /webhook/uazapi
-	if !strings.Contains(agentURL, "/webhook/") {
-		agentURL = agentURL + "/webhook/uazapi"
+	// recupera credenciais/tenant da instância
+	info, err := app.lookupInstanceInfo(r.Context(), instance)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("lookup instance err: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", agentURL, bytes.NewReader(body))
+	// base do backend do Agente IA (podendo vir só o domínio)
+	agentBase := strings.TrimRight(os.Getenv("AGENT_BACKEND_URL"), "/")
+	if agentBase == "" {
+		agentBase = "https://paclead-agente-backend-production.up.railway.app"
+	}
+
+	// monta URL de destino
+	forwardURL := agentBase
+	if strings.Contains(agentBase, "/webhook/") || strings.Contains(agentBase, "/webhooks/") {
+		// já veio com caminho completo — usa como está
+		forwardURL = agentBase
+	} else {
+		// usa slug multi-tenant: /webhooks/{instance}
+		forwardURL = agentBase + "/webhooks/" + url.PathEscape(instance)
+	}
+
+	req, err := http.NewRequest("POST", forwardURL, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("forward build err: %v", err)
 		w.WriteHeader(http.StatusAccepted)
@@ -55,8 +66,14 @@ func (app *App) webhookWa(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Instance-ID", instance)
-	if token != "" {
-		req.Header.Set("X-Instance-Token", token)
+	if info.Token != "" {
+		req.Header.Set("X-Instance-Token", info.Token)
+	}
+	if info.OrgID != "" {
+		req.Header.Set("X-Org-ID", info.OrgID)
+	}
+	if info.FlowID != "" {
+		req.Header.Set("X-Flow-ID", info.FlowID)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -71,20 +88,33 @@ func (app *App) webhookWa(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// lookupInstanceToken busca o token para uma instância armazenada na plataforma
-func (app *App) lookupInstanceToken(ctx context.Context, instance string) (string, error) {
+type instanceInfo struct {
+	Token  string
+	OrgID  string
+	FlowID string
+}
+
+// lookupInstanceInfo busca token/org/flow para uma instância armazenada na plataforma
+func (app *App) lookupInstanceInfo(ctx context.Context, instance string) (instanceInfo, error) {
+	out := instanceInfo{}
 	instance = strings.TrimSpace(instance)
 	if instance == "" {
-		return "", nil
+		return out, nil
 	}
-	var token string
-	// Ajuste o schema/nome da tabela/colunas conforme seu banco
-	err := app.DB.QueryRow(ctx,
-		`SELECT token FROM public.wa_instances WHERE instance_id = $1 LIMIT 1`,
-		instance,
-	).Scan(&token)
-	if err != nil {
-		return "", err
+	// Ajuste o schema/nome da tabela/colunas conforme seu banco.
+	// Fazemos cast para texto para simplificar o Scan em strings.
+	row := app.DB.QueryRow(ctx, `
+		SELECT
+			COALESCE(token, '')                                   AS token,
+			COALESCE(org_id::text, '1')                           AS org_id,
+			COALESCE(flow_id::text, '1')                          AS flow_id
+		FROM public.wa_instances
+		WHERE instance_id = $1
+		LIMIT 1
+	`, instance)
+
+	if err := row.Scan(&out.Token, &out.OrgID, &out.FlowID); err != nil {
+		return instanceInfo{}, err
 	}
-	return token, nil
+	return out, nil
 }
