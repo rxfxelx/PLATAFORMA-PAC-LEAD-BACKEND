@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -49,7 +50,7 @@ func main() {
         AllowCredentials: false,
         MaxAge:           300,
     }))
-    // Preflight catch-all (o middleware já cobre, mas deixamos por segurança)
+    // Preflight catch-all
     r.Options("/*", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
     // Healthcheck
@@ -75,11 +76,9 @@ func main() {
 
         r.Post("/webhooks/n8n", app.webhookN8N)
         // Webhook para eventos da uazapi (multi-instância).
-        // Chegam em /webhooks/wa/{instance} e são respondidos com 202.
         r.Post("/webhooks/wa/{instance}", app.webhookWa)
 
         // Rotas de integração com WhatsApp (uazapi).
-        // Para criar instância, ver status/QR, definir webhook e enviar mensagens.
         app.mountWhatsApp(r)
     })
 
@@ -88,7 +87,6 @@ func main() {
     r.Mount("/uploads", http.StripPrefix("/uploads", http.FileServer(http.Dir(uploadDir))))
 
     log.Printf("listening on %s", addr)
-    // IMPORTANTE: usar o router diretamente (sem corsMiddleware aqui).
     log.Fatal(http.ListenAndServe(addr, r))
 }
 
