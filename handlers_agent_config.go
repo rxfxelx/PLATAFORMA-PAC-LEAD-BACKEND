@@ -1,3 +1,4 @@
+// handlers_agent_config.go
 package main
 
 import (
@@ -30,6 +31,9 @@ func (a *App) mountAgentConfig(r chi.Router) {
         r.Get("/settings", a.getAgentSettings)
         r.Put("/settings", a.putAgentSettings)
     })
+    // >>> Compatibilidade com rota antiga:
+    r.Get("/agent-config", a.getAgentSettings)
+    r.Put("/agent-config", a.putAgentSettings)
 }
 
 func (a *App) getAgentSettings(w http.ResponseWriter, r *http.Request) {
@@ -40,20 +44,24 @@ func (a *App) getAgentSettings(w http.ResponseWriter, r *http.Request) {
 
     var s AgentSettings
     err := a.DB.QueryRow(ctx, `
-        SELECT org_id, flow_id, COALESCE(name, ''), COALESCE(communication_style, ''), COALESCE(sector, ''),
-               COALESCE(profile_type, ''), COALESCE(profile_custom, ''), COALESCE(base_prompt, ''), COALESCE(tax_id, ''), updated_at
-        FROM agent_settings
-        WHERE org_id=$1 AND flow_id=$2
+        SELECT org_id, flow_id,
+               COALESCE(name, ''),
+               COALESCE(communication_style, ''),
+               COALESCE(sector, ''),
+               COALESCE(profile_type, ''),
+               COALESCE(profile_custom, ''),
+               COALESCE(base_prompt, ''),
+               COALESCE(tax_id, ''),
+               updated_at
+          FROM agent_settings
+         WHERE org_id=$1 AND flow_id=$2
     `, orgID, flowID).Scan(
         &s.OrgID, &s.FlowID, &s.Name, &s.CommunicationStyle, &s.Sector,
         &s.ProfileType, &s.ProfileCustom, &s.BasePrompt, &s.TaxID, &s.UpdatedAt,
     )
     if err != nil {
-        // Retorna payload “vazio” se não existir ainda (sem erro 404 para simplificar o consumo)
-        s = AgentSettings{
-            OrgID:  orgID,
-            FlowID: flowID,
-        }
+        // Retorna payload “vazio” se não existir ainda (sem 404 para facilitar consumo)
+        s = AgentSettings{OrgID: orgID, FlowID: flowID}
     }
 
     _ = json.NewEncoder(w).Encode(s)
@@ -113,7 +121,7 @@ func (a *App) putAgentSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseTenant(r *http.Request) (int64, int64) {
-    // Cabeçalhos têm precedência; fallback para querystring (?org_id=, ?flow_id=); por fim, default "1".
+    // Headers têm precedência; fallback para querystring (?org_id=, ?flow_id=); por fim, default "1".
     org := strings.TrimSpace(r.Header.Get("X-Org-ID"))
     flow := strings.TrimSpace(r.Header.Get("X-Flow-ID"))
     if org == "" {
@@ -139,7 +147,7 @@ func parseTenant(r *http.Request) (int64, int64) {
     return orgID, flowID
 }
 
-// reaproveita helper de limpeza de dígitos (mesmo comportamento do agente)
+// helper de limpeza de dígitos (útil para CPF/CNPJ)
 func onlyDigits(s string) string {
     var b strings.Builder
     for _, r := range s {
@@ -150,7 +158,7 @@ func onlyDigits(s string) string {
     return b.String()
 }
 
-// (opcional) proteção simples
+// (opcional) proteção simples para manter import do "errors"
 func must[T any](v T, err error) T {
     if err != nil {
         panic(err)
